@@ -17,7 +17,156 @@ function json(data, status = 200) {
   });
 }
 
+
+async function processImage(env, r2Key, imageId) {
+  if (!r2Key) throw new Error('Missing R2 key');
+
+  // Ensure a D1 row exists
+  if (!imageId) {
+    imageId = crypto.randomUUID();
+    const obj = await env.IMAGES.head(r2Key);
+    if (!obj) throw new Error('Object not found in R2');
+    await env.DB.prepare(
+      `INSERT INTO images (id, r2_key, etag, content_type, size_bytes, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))`
+    ).bind(
+      imageId,
+      r2Key,
+      obj.etag || null,
+      obj.httpMetadata?.contentType || 'image/jpeg',
+      obj.size || null
+    ).run();
+  }
+
+  await env.DB.prepare(
+    "UPDATE images SET status = 'processing', updated_at = datetime('now') WHERE id = ?"
+  ).bind(imageId).run();
+
+  try {
+    const object = await env.IMAGES.get(r2Key);
+    if (!object) throw new Error('Object not found in R2');
+
+    const arrayBuffer = await object.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    const base64 = btoa(binary);
+
+    let description = '';
+    let descriptionSource = 'vision';
+    try {
+      const contentType = object.httpMetadata?.contentType || 'image/jpeg';
+      const imageDataUrl = 'data:' + contentType + ';base64,' + base64;
+
+      const vision = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
+        messages: [
+          { role: 'system', content: 'You are a helpful image catalog assistant.' },
+          { role: 'user', content: 'Describe this image in detail for a fashion/lifestyle catalog. Include clothing, colors, style, mood, setting, and notable objects or people. Be specific and useful for semantic search.' },
+        ],
+        image: imageDataUrl,
+        max_tokens: 1024,
+      });
+
+      description =
+        vision?.response ||
+        vision?.result ||
+        vision?.description ||
+        vision?.choices?.[0]?.message?.content ||
+        (typeof vision === 'string' ? vision : JSON.stringify(vision));
+    } catch (visionErr) {
+      description = `Image from R2 key: ${r2Key}`;
+      descriptionSource = 'fallback';
+      console.warn('Vision model failed, using fallback description', visionErr.message);
+    }
+
+    const embedRes = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+      text: [description],
+    });
+    const vector = embedRes.data?.[0];
+    if (!vector) throw new Error('Embedding failed');
+
+    const vectorId = imageId;
+    await env.VECTORIZE.upsert([
+      {
+        id: vectorId,
+        values: vector,
+        metadata: {
+          r2_key: r2Key,
+          description,
+          description_source: descriptionSource,
+        },
+      },
+    ]);
+
+    await env.DB.prepare(
+      `UPDATE images
+         SET description = ?, status = 'ready', embedding_id = ?, processed_at = datetime('now'), updated_at = datetime('now'), error = NULL
+         WHERE id = ?`
+    ).bind(description, vectorId, imageId).run();
+
+    return {
+      success: true,
+      id: imageId,
+      r2_key: r2Key,
+      description,
+      embedding_id: vectorId,
+      model: '@cf/meta/llama-3.2-11b-vision-instruct',
+    };
+  } catch (err) {
+    await env.DB.prepare(
+      "UPDATE images SET status = 'error', error = ?, updated_at = datetime('now') WHERE id = ?"
+    ).bind(String(err.message || err), imageId).run();
+    throw err;
+  }
+}
+
 export default {
+  async queue(batch, env, ctx) {
+    for (const message of batch.messages) {
+      const event = message.body;
+      const r2Key = event?.object?.key;
+      if (!r2Key || event?.bucket !== 'ai-images') {
+        message.ack();
+        continue;
+      }
+
+      try {
+        // Ignore deletes; this queue is configured for object-create.
+        const existing = await env.DB.prepare(
+          'SELECT id, status, etag FROM images WHERE r2_key = ?'
+        ).bind(r2Key).first();
+
+        if (existing?.status === 'ready' && existing?.etag === event?.object?.eTag) {
+          message.ack();
+          continue;
+        }
+
+        const imageId = existing?.id || crypto.randomUUID();
+        if (!existing) {
+          await env.DB.prepare(
+            `INSERT INTO images (id, r2_key, etag, content_type, size_bytes, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))`
+          ).bind(
+            imageId,
+            r2Key,
+            event?.object?.eTag || null,
+            'image/jpeg',
+            event?.object?.size || null
+          ).run();
+        }
+
+        await processImage(env, r2Key, imageId);
+        message.ack();
+        console.log('Automatically processed R2 object:', r2Key);
+      } catch (err) {
+        console.error('Automatic image processing failed:', r2Key, err);
+        message.retry({ delaySeconds: 30 });
+      }
+    }
+  },
+
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS });
@@ -120,7 +269,7 @@ export default {
         return new Response(object.body, { headers });
       }
 
-      // Process an image: describe + embed + store
+      // Process an image manually or as a fallback.
       if (path === '/process' && request.method === 'POST') {
         let body = {};
         try {
@@ -130,7 +279,6 @@ export default {
         let r2Key = body.r2_key;
         let imageId = body.id;
 
-        // If no key given, pick a pending row or list R2 and create pending
         if (!r2Key) {
           const pending = await env.DB.prepare(
             "SELECT id, r2_key FROM images WHERE status = 'pending' LIMIT 1"
@@ -142,7 +290,6 @@ export default {
         }
 
         if (!r2Key) {
-          // Find an R2 object not yet in D1
           const listed = await env.IMAGES.list({ limit: 10 });
           for (const obj of listed.objects || []) {
             const exists = await env.DB.prepare(
@@ -155,112 +302,14 @@ export default {
           }
         }
 
-        if (!r2Key) {
-          return json({ error: 'No image to process' }, 404);
-        }
-
-        // Ensure a D1 row exists
-        if (!imageId) {
-          imageId = crypto.randomUUID();
-          const obj = await env.IMAGES.head(r2Key);
-          await env.DB.prepare(
-            `INSERT INTO images (id, r2_key, etag, content_type, size_bytes, status, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))`
-          ).bind(
-            imageId,
-            r2Key,
-            obj?.etag || null,
-            obj?.httpMetadata?.contentType || 'image/jpeg',
-            obj?.size || null
-          ).run();
-        }
-
-        // Mark as processing
-        await env.DB.prepare(
-          "UPDATE images SET status = 'processing', updated_at = datetime('now') WHERE id = ?"
-        ).bind(imageId).run();
+        if (!r2Key) return json({ error: 'No image to process' }, 404);
 
         try {
-          // Fetch image from R2
-          const object = await env.IMAGES.get(r2Key);
-          if (!object) throw new Error('Object not found in R2');
-
-          const arrayBuffer = await object.arrayBuffer();
-          // Convert to base64 for the vision model
-          const bytes = new Uint8Array(arrayBuffer);
-          let binary = '';
-          for (let i = 0; i < bytes.length; i++) {
-            binary += String.fromCharCode(bytes[i]);
-          }
-          const base64 = btoa(binary);
-
-          // Describe image with Llama 3.2 11B Vision (Free)
-          let description = '';
-          try {
-            const contentType = object.httpMetadata?.contentType || 'image/jpeg';
-            const imageDataUrl = 'data:' + contentType + ';base64,' + base64;
-
-            const vision = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
-              messages: [
-                { role: 'system', content: 'You are a helpful image catalog assistant.' },
-                { role: 'user', content: 'Describe this image in detail for a fashion/lifestyle catalog. Include clothing, colors, style, mood, setting, and notable objects or people. Be specific and useful for semantic search.' },
-              ],
-              image: imageDataUrl,
-              max_tokens: 1024,
-            });
-
-            // Response format can vary
-            description =
-              vision?.response ||
-              vision?.result ||
-              vision?.description ||
-              vision?.choices?.[0]?.message?.content ||
-              (typeof vision === 'string' ? vision : JSON.stringify(vision));
-          } catch (visionErr) {
-            description = `Image from R2 key: ${r2Key}`;
-            console.warn('Vision model failed, using fallback description', visionErr.message);
-          }
-
-          // Embed the description
-          const embedRes = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-            text: [description],
-          });
-          const vector = embedRes.data?.[0];
-          if (!vector) throw new Error('Embedding failed');
-
-          // Upsert into Vectorize
-          const vectorId = imageId;
-          await env.VECTORIZE.upsert([
-            {
-              id: vectorId,
-              values: vector,
-              metadata: {
-                r2_key: r2Key,
-                description,
-              },
-            },
-          ]);
-
-          // Update D1
-          await env.DB.prepare(
-            `UPDATE images
-               SET description = ?, status = 'ready', embedding_id = ?, processed_at = datetime('now'), updated_at = datetime('now'), error = NULL
-               WHERE id = ?`
-          ).bind(description, vectorId, imageId).run();
-
-          return json({
-            success: true,
-            id: imageId,
-            r2_key: r2Key,
-            description,
-            embedding_id: vectorId,
-            model: '@cf/meta/llama-3.2-11b-vision-instruct',
-          });
+          const result = await processImage(env, r2Key, imageId);
+          return json(result);
         } catch (err) {
-          await env.DB.prepare(
-            "UPDATE images SET status = 'error', error = ?, updated_at = datetime('now') WHERE id = ?"
-          ).bind(String(err.message || err), imageId).run();
-          throw err;
+          console.error('Manual processing failed', err);
+          return json({ error: err.message || String(err) }, 500);
         }
       }
 
