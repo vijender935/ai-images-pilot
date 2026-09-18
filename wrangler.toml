@@ -24,3 +24,7 @@ max_batch_size = 5
 max_batch_timeout = 2
 max_retries = 5
 dead_letter_queue = "ai-images-auto-process-dlq"
+
+
+[triggers]
+crons = ["0 0 * * *"]
