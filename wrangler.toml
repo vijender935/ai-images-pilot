@@ -1,0 +1,19 @@
+name = "ai-images-pilot"
+main = "src/index.js"
+compatibility_date = "2025-05-01"
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ai-images-db"
+database_id = "2caa9097-c3b2-43f0-90b4-2db424b90fd6"
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "ai-images"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "ai-images-index"
