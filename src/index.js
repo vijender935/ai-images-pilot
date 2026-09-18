@@ -99,6 +99,27 @@ export default {
         });
       }
 
+      // Retrieve a single image from the private R2 bucket.
+      // The MCP gateway uses this endpoint through a Cloudflare Service Binding,
+      // so the R2 bucket itself does not need a public URL.
+      if (path === '/image' && request.method === 'GET') {
+        const key = url.searchParams.get('key');
+        if (!key) return json({ error: 'Missing query parameter key' }, 400);
+
+        const object = await env.IMAGES.get(key);
+        if (!object) return json({ error: 'Image not found', key }, 404);
+
+        const headers = new Headers(CORS);
+        headers.set(
+          'Content-Type',
+          object.httpMetadata?.contentType || 'application/octet-stream'
+        );
+        headers.set('Cache-Control', 'private, max-age=300');
+        if (object.httpEtag) headers.set('ETag', object.httpEtag);
+
+        return new Response(object.body, { headers });
+      }
+
       // Process an image: describe + embed + store
       if (path === '/process' && request.method === 'POST') {
         let body = {};
