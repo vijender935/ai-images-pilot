@@ -123,6 +123,47 @@ async function processImage(env, r2Key, imageId) {
 }
 
 export default {
+  async scheduled(event, env, ctx) {
+    // Daily fallback scanner for accounts where R2 Event Notifications are unavailable.
+    const listed = await env.IMAGES.list({ limit: 100 });
+    let processed = 0;
+
+    for (const obj of listed.objects || []) {
+      if (!obj.key) continue;
+
+      const existing = await env.DB.prepare(
+        'SELECT id, status, etag FROM images WHERE r2_key = ?'
+      ).bind(obj.key).first();
+
+      if (existing?.status === 'ready' && existing?.etag === obj.etag) continue;
+      if (existing?.status === 'processing') continue;
+
+      try {
+        const imageId = existing?.id || crypto.randomUUID();
+
+        if (!existing) {
+          await env.DB.prepare(
+            `INSERT INTO images (id, r2_key, etag, content_type, size_bytes, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))`
+          ).bind(
+            imageId,
+            obj.key,
+            obj.etag || null,
+            obj.httpMetadata?.contentType || 'image/jpeg',
+            obj.size || null
+          ).run();
+        }
+
+        await processImage(env, obj.key, imageId);
+        processed++;
+      } catch (err) {
+        console.error('Scheduled image processing failed:', obj.key, err);
+      }
+    }
+
+    console.log(`Daily scan complete. Processed: ${processed}`);
+  },
+
   async queue(batch, env, ctx) {
     for (const message of batch.messages) {
       const event = message.body;
