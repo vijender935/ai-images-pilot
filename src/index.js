@@ -6,12 +6,56 @@ const CORS = {
 
 const QUEUE_NAME = 'ai-images-process';
 const STALE_AFTER_MINUTES = 30;
+const DRAIN_CRON = '*/10 * * * *';
+const DEFAULT_DRAIN_LIMIT = 40;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: { 'Content-Type': 'application/json', ...CORS },
   });
+}
+
+function isStaleProcessing(row) {
+  if (row?.status !== 'processing' || !row.updated_at) return false;
+  const ts = Date.parse(String(row.updated_at).replace(' ', 'T') + 'Z');
+  return Number.isFinite(ts) && ts < Date.now() - STALE_AFTER_MINUTES * 60 * 1000;
+}
+
+function toBase64(bytes) {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function loadExistingByKey(env) {
+  const byKey = new Map();
+  let offset = 0;
+  const pageSize = 500;
+  while (true) {
+    const { results } = await env.DB.prepare(
+      'SELECT id, r2_key, status, etag, updated_at FROM images LIMIT ? OFFSET ?'
+    ).bind(pageSize, offset).all();
+    const rows = results || [];
+    for (const row of rows) byKey.set(row.r2_key, row);
+    if (rows.length < pageSize) break;
+    offset += pageSize;
+  }
+  return byKey;
+}
+
+async function sendQueueBatches(env, messages) {
+  let queued = 0;
+  for (let i = 0; i < messages.length; i += 100) {
+    const batch = messages.slice(i, i + 100);
+    if (!batch.length) continue;
+    await env.PROCESS_QUEUE.sendBatch(batch);
+    queued += batch.length;
+  }
+  return queued;
 }
 
 async function ensureImageRow(env, r2Key, imageId, object) {
@@ -43,25 +87,19 @@ async function processImage(env, r2Key, imageId) {
   try {
     const arrayBuffer = await object.arrayBuffer();
     const bytes = new Uint8Array(arrayBuffer);
-    let binary = '';
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-    }
-    const base64 = btoa(binary);
     const contentType = object.httpMetadata?.contentType || 'image/jpeg';
-    const imageDataUrl = `data:${contentType};base64,${base64}`;
+    const imageDataUrl = `data:${contentType};base64,${toBase64(bytes)}`;
 
     const vision = await env.AI.run('@cf/meta/llama-3.2-11b-vision-instruct', {
       messages: [
         { role: 'system', content: 'You are a helpful image catalog assistant.' },
         {
           role: 'user',
-          content: 'Describe this image in detail for a fashion/lifestyle catalog. Include clothing, colors, style, mood, setting, and notable objects or people. Be specific and useful for semantic search.',
+          content: 'Describe this fashion/lifestyle photo in 80-120 words. Include clothing, colors, style, mood, setting, and notable objects. Be specific for search.',
         },
       ],
       image: imageDataUrl,
-      max_tokens: 1024,
+      max_tokens: 400,
     });
 
     const description =
@@ -71,7 +109,7 @@ async function processImage(env, r2Key, imageId) {
       vision?.choices?.[0]?.message?.content ||
       (typeof vision === 'string' ? vision : JSON.stringify(vision));
 
-    if (!description || description.startsWith('{"')) {
+    if (!description || description.startsWith('{')) {
       throw new Error('Vision model returned no usable description');
     }
 
@@ -115,8 +153,37 @@ async function processImage(env, r2Key, imageId) {
   }
 }
 
+async function drainPending(env, limit = DEFAULT_DRAIN_LIMIT) {
+  if (!env.PROCESS_QUEUE) throw new Error(`Missing queue binding PROCESS_QUEUE (${QUEUE_NAME})`);
+  const cap = Math.max(1, Math.min(Number(limit) || DEFAULT_DRAIN_LIMIT, 100));
+
+  await env.DB.prepare(
+    `UPDATE images
+     SET status = 'pending', error = NULL, updated_at = datetime('now')
+     WHERE status = 'processing'
+       AND updated_at < datetime('now', ?)`
+  ).bind(`-${STALE_AFTER_MINUTES} minutes`).run();
+
+  const { results } = await env.DB.prepare(
+    `SELECT id, r2_key FROM images
+     WHERE status IN ('pending', 'error')
+     ORDER BY updated_at ASC
+     LIMIT ?`
+  ).bind(cap).all();
+
+  const rows = results || [];
+  const messages = rows
+    .filter((row) => row.r2_key)
+    .map((row) => ({ body: { type: 'process-image', r2_key: row.r2_key, id: row.id } }));
+
+  const queued = await sendQueueBatches(env, messages);
+  return { queue: QUEUE_NAME, selected: rows.length, queued, limit: cap };
+}
+
 async function enqueueAllImages(env) {
   if (!env.PROCESS_QUEUE) throw new Error(`Missing queue binding PROCESS_QUEUE (${QUEUE_NAME})`);
+  const existingByKey = await loadExistingByKey(env);
+
   let cursor;
   let scanned = 0;
   let queued = 0;
@@ -131,18 +198,10 @@ async function enqueueAllImages(env) {
     for (const object of page.objects || []) {
       if (!object.key) continue;
       scanned++;
-      const existing = await env.DB.prepare(
-        'SELECT id, status, etag, updated_at FROM images WHERE r2_key = ?'
-      ).bind(object.key).first();
-
-      const stale = existing?.status === 'processing' && existing.updated_at &&
-        Date.parse(existing.updated_at.replace(' ', 'T') + 'Z') < Date.now() - STALE_AFTER_MINUTES * 60 * 1000;
+      const existing = existingByKey.get(object.key);
+      const stale = isStaleProcessing(existing);
       const unchangedReady = existing?.status === 'ready' && existing.etag === object.etag;
-      if (unchangedReady) {
-        skipped++;
-        continue;
-      }
-      if (existing?.status === 'processing' && !stale) {
+      if (unchangedReady || (existing?.status === 'processing' && !stale)) {
         skipped++;
         continue;
       }
@@ -153,21 +212,17 @@ async function enqueueAllImages(env) {
           `INSERT INTO images (id, r2_key, etag, content_type, size_bytes, status, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))`
         ).bind(id, object.key, object.etag || null, object.httpMetadata?.contentType || 'image/jpeg', object.size || null).run();
+        existingByKey.set(object.key, { id, r2_key: object.key, status: 'pending', etag: object.etag });
       } else {
         await env.DB.prepare(
           "UPDATE images SET status = 'pending', error = NULL, updated_at = datetime('now') WHERE id = ?"
         ).bind(id).run();
+        existing.status = 'pending';
       }
       messages.push({ body: { type: 'process-image', r2_key: object.key, id } });
     }
 
-    for (let i = 0; i < messages.length; i += 100) {
-      const batch = messages.slice(i, i + 100);
-      if (batch.length) {
-        await env.PROCESS_QUEUE.sendBatch(batch);
-        queued += batch.length;
-      }
-    }
+    queued += await sendQueueBatches(env, messages);
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
 
@@ -185,7 +240,10 @@ async function progress(env) {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(enqueueAllImages(env).then((r) => console.log('Queue fan-out complete', r)).catch((e) => console.error('Queue fan-out failed', e)));
+    const job = event.cron === DRAIN_CRON
+      ? drainPending(env, DEFAULT_DRAIN_LIMIT)
+      : enqueueAllImages(env);
+    ctx.waitUntil(job.then((r) => console.log('scheduled job complete', event.cron, r)).catch((e) => console.error('scheduled job failed', event.cron, e)));
   },
 
   async queue(batch, env) {
@@ -200,12 +258,12 @@ export default {
         message.ack();
       } catch (err) {
         console.error('Queue image processing failed', job.r2_key, err);
-        message.retry({ delaySeconds: 30 });
+        message.retry({ delaySeconds: 10 });
       }
     }
   },
 
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/$/, '') || '/';
@@ -218,6 +276,10 @@ export default {
       }
       if (path === '/progress' && request.method === 'GET') return json(await progress(env));
       if (path === '/enqueue' && request.method === 'POST') return json(await enqueueAllImages(env));
+      if (path === '/drain' && request.method === 'POST') {
+        const limit = url.searchParams.get('limit') || DEFAULT_DRAIN_LIMIT;
+        return json(await drainPending(env, limit));
+      }
 
       if (path === '/images' && request.method === 'GET') {
         const limit = Math.min(parseInt(url.searchParams.get('limit') || '20', 10), 100);

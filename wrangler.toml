@@ -25,9 +25,10 @@ queue = "ai-images-process"
 [[queues.consumers]]
 queue = "ai-images-process"
 max_batch_size = 1
-max_batch_timeout = 5
-max_retries = 3
-retry_delay = 30
+max_batch_timeout = 1
+max_retries = 5
+retry_delay = 10
+max_concurrency = 8
 
 [triggers]
-crons = ["0 0 * * *"]
+crons = ["*/10 * * * *", "0 0 * * *"]
